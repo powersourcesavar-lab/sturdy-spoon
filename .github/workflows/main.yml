@@ -1,0 +1,109 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360 # Maximum allowed execution time on GitHub-hosted runners
+
+    steps:
+      - name: Configure RDP Registry and Firewall
+        shell: powershell
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+
+          # Configure Firewall Rule for Port 3389
+          Remove-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389
+
+          # Enable TermService
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+
+      - name: Create Secure Admin User
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+            Upper   = [char[]](65..90)
+            Lower   = [char[]](97..122)
+            Number  = [char[]](48..57)
+            Special = [char[]](33..47) + [char[]](58..64)
+          }
+
+          $rawPassword = @()
+          $rawPassword +=$charSet.Upper | Get-Random -Count 4
+          $rawPassword +=$charSet.Lower | Get-Random -Count 4
+          $rawPassword +=$charSet.Number | Get-Random -Count 4
+          $rawPassword +=$charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          # Mask password in GitHub Actions logs
+          Write-Host "::add-mask::$password"
+
+          $securePass = ConvertTo-SecureString$password -AsPlainText -Force
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires -ErrorAction Stop
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+
+          "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: Install and Start Tailscale
+        shell: powershell
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile$installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+          # Add Tailscale to Path for current process
+          $env:Path += ";$env:ProgramFiles\Tailscale"
+
+          # Connect Tailscale
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Get assigned Tailscale IP
+          $tsIP = $null$retries = 0
+          while (-not $tsIP -and$retries -lt 12) {
+              Start-Sleep -Seconds 5
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Failed to retrieve Tailscale IP."
+              exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify and Print Connection Details
+        shell: powershell
+        run: |
+          Write-Host "=============================="
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Username:     RDPUser"
+          Write-Host "Password:     $env:RDP_PASS" # Will display as *** in logs due to mask
+          Write-Host "=============================="
+
+          $test = Test-NetConnection -ComputerName$env:TAILSCALE_IP -Port 3389
+          if (-not $test.TcpTestSucceeded) {
+              Write-Error "RDP Port 3389 is unreachable on Tailscale interface."
+              exit 1
+          }
+
+      - name: Keep Runner Alive
+        shell: powershell
+        run: |
+          $timeout = [System.Diagnostics.Stopwatch]::StartNew()
+          # Loop up to 5.5 hours (330 minutes) to avoid abrupt GitHub runner killed error
+          while ($timeout.Elapsed.TotalMinutes -lt 330) {
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active on$env:TAILSCALE_IP"
+              Start-Sleep -Seconds 180
+          }
